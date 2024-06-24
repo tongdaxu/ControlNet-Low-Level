@@ -1,5 +1,7 @@
 import os
 import torch
+import argparse 
+
 from pipe import EulerAncestralDiscreteInverse, StableDiffusionControlNetInverse
 from dataset import ImageDataset
 from op import SuperResolutionOperator
@@ -15,15 +17,23 @@ from transformers import AutoTokenizer
 from train_controlnet import import_model_class_from_model_name_or_path
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='ControlNet for Low Level vision')
+    parser.add_argument('--data', type=str)
+    parser.add_argument('--out', type=str)
+    parser.add_argument('--cnmodel', type=str)
+    parser.add_argument('--scale', type=float, default=2.4)
+
+    args = parser.parse_args()
+
     seed=64
     torch.manual_seed(seed=seed)
     torch.cuda.manual_seed_all(seed=seed)
     np.random.seed(seed=seed)
 
     DTYPE = torch.float32
-    DATA_ROOT = "./gen_512"
-    OUT_ROOT = "./examples"
-    SCALE = 2.4
+    DATA_ROOT = args.data
+    OUT_ROOT = args.out
+    SCALE = args.scale
 
     out_dirs = ["source", "low_res", "recon", "recon_low_res"]
     out_dirs = [os.path.join(OUT_ROOT, o) for o in out_dirs]
@@ -44,7 +54,6 @@ if __name__ == "__main__":
     model_id = "stabilityai/stable-diffusion-2-base"
 
     scheduler = EulerAncestralDiscreteInverse.from_pretrained(model_id, subfolder="scheduler")
-    # scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
     text_encoder_cls = import_model_class_from_model_name_or_path(model_id, None)
     text_encoder = text_encoder_cls.from_pretrained(
         model_id, subfolder="text_encoder",
@@ -56,7 +65,7 @@ if __name__ == "__main__":
         model_id, subfolder="unet",
     )
     # controlnet = ControlNetModel.from_pretrained("/NEW_EDS/JJ_Group/xutd/diffusion-inversion/sd2cn_srx8_25/checkpoint-4000/controlnet")
-    controlnet = ControlNetModel.from_pretrained("xutongda/control_e_sd2.0_srx8")
+    controlnet = ControlNetModel.from_pretrained(args.cnmodel)
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         subfolder="tokenizer",
