@@ -14,8 +14,8 @@ def print_avgs(avgs, a=0):
         print("{0}: {1:.4}, ".format(key, np.mean(avgs[key][a:])), end="")
     print("")
 
-ref_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/results/imagenet/savi/source'
-dis_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/results/imagenet/savi/savi'
+ref_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/imagenet_512'
+dis_path = '/NEW_EDS/JJ_Group/xutd/StableSR/out/sdsr'
 
 test_transforms = transforms.Compose(
     [transforms.ToTensor()]

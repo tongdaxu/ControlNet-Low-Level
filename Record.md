@@ -240,7 +240,7 @@ CUDA_VISIBLE_DEVICES=1 proxychains python stablesr.py
 CUDA_VISIBLE_DEVICES=1 proxychains python main_sd3.py
 
 
-CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 --main_process_port 29502 train_stablesr.py \
+CUDA_VISIBLE_DEVICES=1,2,3,6 nohup accelerate launch --num_processes 4 --main_process_port 29502 train_stablesr.py \
  --pretrained_model_name_or_path "stabilityai/stable-diffusion-2-base" \
  --operator "srx8" \
  --output_dir "sdsr_srx8_full/" \
@@ -250,11 +250,11 @@ CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 --main_process_port 2
  --image_column=image \
  --caption_column=text \
  --resolution=512 \
- --learning_rate=1e-5 \
- --train_batch_size=6 \
+ --learning_rate=5e-5 \
+ --train_batch_size=4 \
  --gradient_accumulation_steps=3 \
  --num_train_epochs=10000 \
  --tracker_project_name="controlnet" \
  --enable_xformers_memory_efficient_attention \
- --checkpointing_steps=1 \
- --validation_steps=1
+ --checkpointing_steps=500 \
+ --validation_steps=500 &> sdsr_srx8_full.out &
