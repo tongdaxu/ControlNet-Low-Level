@@ -14,8 +14,8 @@ def print_avgs(avgs, a=0):
         print("{0}: {1:.4}, ".format(key, np.mean(avgs[key][a:])), end="")
     print("")
 
-ref_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/imagenet_512'
-dis_path = '/NEW_EDS/JJ_Group/xutd/StableSR/out/sdsr'
+ref_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/results/imagenet/srx8/max_500s_4.8/source'
+dis_path = '/NEW_EDS/JJ_Group/xutd/diffusion-inversion/results/imagenet/srx8/max_500s_4.8/recon'
 
 test_transforms = transforms.Compose(
     [transforms.ToTensor()]
@@ -41,7 +41,8 @@ avgs = {
 with torch.no_grad():
     fid_computer.clear_pools()
     for i, ((x, _), (x_hat, _)) in tqdm(enumerate(zip(ref_dataloader, dis_dataloader))):
-
+        if i >= 30:
+            break
         x1 = x.cuda()
         x2 = x_hat.cuda()
         

@@ -38,7 +38,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
-from op import SuperResolutionOperator, EdgeOperator
+from op import SuperResolutionOperator, EdgeOperator, GaussialBlurOperator, PhaseRetrievalOperator, NonlinearBlurOperator
 from torchvision.transforms.functional import to_pil_image
 
 import diffusers
@@ -617,6 +617,12 @@ def main(args):
         operator = SuperResolutionOperator([1, 3, 512, 512], 8)
     elif args.operator == "edge":
         operator = EdgeOperator()
+    elif args.operator == "gdb":
+        operator = GaussialBlurOperator()
+    elif args.operator == "pr":
+        operator = PhaseRetrievalOperator()
+    elif args.operator == "nlb":
+        operator = NonlinearBlurOperator()
     else:
         raise ValueError
 
@@ -761,7 +767,7 @@ def main(args):
     train_dataset = ImageCaptionDataset(args.train_data, train_inputs, train_transforms)
     indice = [i for i in range(len(train_dataset))]
 
-    SHOT = 1000
+    SHOT = 100
     if SHOT > 0:
         random.seed(42)
         random.shuffle(indice)

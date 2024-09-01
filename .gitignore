@@ -1,0 +1,9 @@
+results/
+examples/
+taming/
+models/
+bkse/
+zyr_folder/
+*.pdf
+*.txt
+*.out

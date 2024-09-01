@@ -2,16 +2,123 @@ import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional, Tuple, Union
 
+from diffusers.models.downsampling import Downsample2D
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
-from diffusers.models.unets.unet_2d_blocks import get_down_block, get_mid_block, get_up_block, DownBlock2D, CrossAttnDownBlock2D, UNetMidBlock2DCrossAttn, UpBlock2D, CrossAttnUpBlock2D
+from diffusers.models.unets.unet_2d_blocks import get_down_block, get_mid_block, get_up_block, DownBlock2D, AttnDownBlock2D, CrossAttnDownBlock2D, UNetMidBlock2DCrossAttn, UpBlock2D, CrossAttnUpBlock2D, UNetMidBlock2D
 from diffusers.configuration_utils import register_to_config
 from diffusers.utils.import_utils import is_torch_version
 from diffusers.utils.torch_utils import apply_freeu
 from diffusers.models.activations import get_activation
 from diffusers.models.embeddings import TimestepEmbedding
 from transformers import AutoTokenizer
-
+from diffusers.models.resnet import ResnetBlock2D
 from spade import SPADE
+
+class ResnetBlock2DSDSR(ResnetBlock2D):
+    def __init__(
+        self, 
+        *,
+        semb_channels: int,
+        in_channels: int,
+        out_channels: Optional[int] = None,
+        conv_shortcut: bool = False,
+        dropout: float = 0.0,
+        temb_channels: int = 512,
+        groups: int = 32,
+        groups_out: Optional[int] = None,
+        pre_norm: bool = True,
+        eps: float = 1e-6,
+        non_linearity: str = "swish",
+        skip_time_act: bool = False,
+        time_embedding_norm: str = "default",  # default, scale_shift,
+        kernel: Optional[torch.Tensor] = None,
+        output_scale_factor: float = 1.0,
+        use_in_shortcut: Optional[bool] = None,
+        up: bool = False,
+        down: bool = False,
+        conv_shortcut_bias: bool = True,
+        conv_2d_out_channels: Optional[int] = None,
+    ):
+        super().__init__(
+            in_channels = in_channels,
+            out_channels = out_channels,
+            conv_shortcut = conv_shortcut,
+            dropout = dropout,
+            temb_channels = temb_channels,
+            groups = groups,
+            groups_out = groups_out,
+            pre_norm = pre_norm,
+            eps = eps,
+            non_linearity = non_linearity,
+            skip_time_act = skip_time_act,
+            time_embedding_norm = time_embedding_norm,  # default, scale_shift,
+            kernel = kernel,
+            output_scale_factor = output_scale_factor,
+            use_in_shortcut = use_in_shortcut,
+            up = up,
+            down = down,
+            conv_shortcut_bias = conv_shortcut_bias,
+            conv_2d_out_channels = conv_2d_out_channels,
+        )
+        self.spade = SPADE(out_channels, semb_channels)
+
+    def forward(self, input_tensor: torch.Tensor, temb: torch.Tensor, 
+                semb: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
+            deprecate("scale", "1.0.0", deprecation_message)
+
+        hidden_states = input_tensor
+
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = self.nonlinearity(hidden_states)
+
+        if self.upsample is not None:
+            # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
+            if hidden_states.shape[0] >= 64:
+                input_tensor = input_tensor.contiguous()
+                hidden_states = hidden_states.contiguous()
+            input_tensor = self.upsample(input_tensor)
+            hidden_states = self.upsample(hidden_states)
+        elif self.downsample is not None:
+            input_tensor = self.downsample(input_tensor)
+            hidden_states = self.downsample(hidden_states)
+
+        hidden_states = self.conv1(hidden_states)
+
+        if self.time_emb_proj is not None:
+            if not self.skip_time_act:
+                temb = self.nonlinearity(temb)
+            temb = self.time_emb_proj(temb)[:, :, None, None]
+
+        if self.time_embedding_norm == "default":
+            if temb is not None:
+                hidden_states = hidden_states + temb
+            hidden_states = self.norm2(hidden_states)
+        elif self.time_embedding_norm == "scale_shift":
+            if temb is None:
+                raise ValueError(
+                    f" `temb` should not be None when `time_embedding_norm` is {self.time_embedding_norm}"
+                )
+            time_scale, time_shift = torch.chunk(temb, 2, dim=1)
+            hidden_states = self.norm2(hidden_states)
+            hidden_states = hidden_states * (1 + time_scale) + time_shift
+        else:
+            hidden_states = self.norm2(hidden_states)
+
+        hidden_states = self.nonlinearity(hidden_states)
+
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.conv2(hidden_states)
+
+        if self.conv_shortcut is not None:
+            input_tensor = self.conv_shortcut(input_tensor)
+
+        hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
+        output_tensor = (input_tensor + hidden_states) / self.output_scale_factor
+
+        return output_tensor
+
 
 class DownBlock2DSDSR(DownBlock2D):
     def __init__(
@@ -46,7 +153,28 @@ class DownBlock2DSDSR(DownBlock2D):
             add_downsample = add_downsample,
             downsample_padding = downsample_padding,
         )
-        self.spade = SPADE(out_channels, semb_channels)
+
+        resnets = []
+
+        for i in range(num_layers):
+            in_channels = in_channels if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock2DSDSR(
+                    semb_channels=semb_channels,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+
+        self.resnets = nn.ModuleList(resnets)
 
 
     def forward(
@@ -67,17 +195,14 @@ class DownBlock2DSDSR(DownBlock2D):
 
                 if is_torch_version(">=", "1.11.0"):
                     hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
+                        create_custom_forward(resnet), hidden_states, temb, semb, use_reentrant=False
                     )
                 else:
                     hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(resnet), hidden_states, temb
+                        create_custom_forward(resnet), hidden_states, temb, semb
                     )
             else:
-                hidden_states = resnet(hidden_states, temb)
-
-            if i == len(self.resnets) - 1:
-                hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
+                hidden_states = resnet(hidden_states, temb, semb)
 
             output_states = output_states + (hidden_states,)
 
@@ -139,7 +264,25 @@ class CrossAttnDownBlock2DSDSR(CrossAttnDownBlock2D):
         upcast_attention = upcast_attention,
         attention_type = attention_type,
         )
-        self.spade = SPADE(out_channels, semb_channels)
+        resnets = []
+        for i in range(num_layers):
+            in_channels = in_channels if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock2DSDSR(
+                    semb_channels=semb_channels,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+        self.resnets = nn.ModuleList(resnets)
 
     def forward(
         self,
@@ -174,6 +317,7 @@ class CrossAttnDownBlock2DSDSR(CrossAttnDownBlock2D):
                     create_custom_forward(resnet),
                     hidden_states,
                     temb,
+                    semb,
                     **ckpt_kwargs,
                 )
                 hidden_states = attn(
@@ -185,7 +329,7 @@ class CrossAttnDownBlock2DSDSR(CrossAttnDownBlock2D):
                     return_dict=False,
                 )[0]
             else:
-                hidden_states = resnet(hidden_states, temb)
+                hidden_states = resnet(hidden_states, temb, semb)
                 hidden_states = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -199,9 +343,6 @@ class CrossAttnDownBlock2DSDSR(CrossAttnDownBlock2D):
             if i == len(blocks) - 1 and additional_residuals is not None:
                 hidden_states = hidden_states + additional_residuals
 
-            if i == len(blocks) - 1:
-                hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
-
             output_states = output_states + (hidden_states,)
 
         if self.downsamplers is not None:
@@ -211,6 +352,7 @@ class CrossAttnDownBlock2DSDSR(CrossAttnDownBlock2D):
             output_states = output_states + (hidden_states,)
 
         return hidden_states, output_states
+
 
 class UNetMidBlock2DCrossAttnSDSR(UNetMidBlock2DCrossAttn):
     def __init__(
@@ -257,7 +399,47 @@ class UNetMidBlock2DCrossAttnSDSR(UNetMidBlock2DCrossAttn):
             upcast_attention = upcast_attention,
             attention_type = attention_type,
         )
-        self.spade = SPADE(in_channels, semb_channels)
+
+        out_channels = out_channels or in_channels
+
+        resnet_groups_out = resnet_groups_out or resnet_groups
+
+        resnets = [
+            ResnetBlock2DSDSR(
+                semb_channels=semb_channels,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                temb_channels=temb_channels,
+                eps=resnet_eps,
+                groups=resnet_groups,
+                groups_out=resnet_groups_out,
+                dropout=dropout,
+                time_embedding_norm=resnet_time_scale_shift,
+                non_linearity=resnet_act_fn,
+                output_scale_factor=output_scale_factor,
+                pre_norm=resnet_pre_norm,
+            )
+        ]
+
+        for i in range(num_layers):
+            resnets.append(
+                ResnetBlock2DSDSR(
+                    semb_channels=semb_channels,
+                    in_channels=out_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups_out,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+
+        self.resnets = nn.ModuleList(resnets)
+
 
     def forward(
         self,
@@ -270,7 +452,7 @@ class UNetMidBlock2DCrossAttnSDSR(UNetMidBlock2DCrossAttn):
         encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        hidden_states = self.resnets[0](hidden_states, temb)
+        hidden_states = self.resnets[0](hidden_states, temb, semb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if self.training and self.gradient_checkpointing:
 
@@ -296,6 +478,7 @@ class UNetMidBlock2DCrossAttnSDSR(UNetMidBlock2DCrossAttn):
                     create_custom_forward(resnet),
                     hidden_states,
                     temb,
+                    semb,
                     **ckpt_kwargs,
                 )
             else:
@@ -307,8 +490,8 @@ class UNetMidBlock2DCrossAttnSDSR(UNetMidBlock2DCrossAttn):
                     encoder_attention_mask=encoder_attention_mask,
                     return_dict=False,
                 )[0]
-                hidden_states = resnet(hidden_states, temb)
-        hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
+                hidden_states = resnet(hidden_states, temb, semb)
+
         return hidden_states
 
 
@@ -347,7 +530,30 @@ class UpBlock2DSDSR(UpBlock2D):
             output_scale_factor = output_scale_factor,
             add_upsample = add_upsample,
         )
-        self.spade = SPADE(out_channels, semb_channels)
+
+        resnets = []
+
+        for i in range(num_layers):
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+
+            resnets.append(
+                ResnetBlock2DSDSR(
+                    semb_channels=semb_channels,
+                    in_channels=resnet_in_channels + res_skip_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+
+        self.resnets = nn.ModuleList(resnets)
 
 
     def forward(
@@ -397,22 +603,21 @@ class UpBlock2DSDSR(UpBlock2D):
 
                 if is_torch_version(">=", "1.11.0"):
                     hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(resnet), hidden_states, temb, use_reentrant=False
+                        create_custom_forward(resnet), hidden_states, temb, semb, use_reentrant=False
                     )
                 else:
                     hidden_states = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(resnet), hidden_states, temb
+                        create_custom_forward(resnet), hidden_states, temb, semb,
                     )
             else:
-                hidden_states = resnet(hidden_states, temb)
-
-        hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
+                hidden_states = resnet(hidden_states, temb, semb)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size)
 
         return hidden_states
+
 
 class CrossAttnUpBlock2DSDSR(CrossAttnUpBlock2D):
     def __init__(
@@ -465,7 +670,26 @@ class CrossAttnUpBlock2DSDSR(CrossAttnUpBlock2D):
             upcast_attention = upcast_attention,
             attention_type = attention_type,
         )
-        self.spade = SPADE(out_channels, semb_channels)
+        resnets = []
+        for i in range(num_layers):
+            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
+            resnet_in_channels = prev_output_channel if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock2DSDSR(
+                    semb_channels=semb_channels,
+                    in_channels=resnet_in_channels + res_skip_channels,
+                    out_channels=out_channels,
+                    temb_channels=temb_channels,
+                    eps=resnet_eps,
+                    groups=resnet_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=resnet_act_fn,
+                    output_scale_factor=output_scale_factor,
+                    pre_norm=resnet_pre_norm,
+                )
+            )
+        self.resnets = nn.ModuleList(resnets)
 
 
     def forward(
@@ -523,6 +747,7 @@ class CrossAttnUpBlock2DSDSR(CrossAttnUpBlock2D):
                     create_custom_forward(resnet),
                     hidden_states,
                     temb,
+                    semb,
                     **ckpt_kwargs,
                 )
                 hidden_states = attn(
@@ -534,7 +759,7 @@ class CrossAttnUpBlock2DSDSR(CrossAttnUpBlock2D):
                     return_dict=False,
                 )[0]
             else:
-                hidden_states = resnet(hidden_states, temb)
+                hidden_states = resnet(hidden_states, temb, semb)
                 hidden_states = attn(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -544,13 +769,12 @@ class CrossAttnUpBlock2DSDSR(CrossAttnUpBlock2D):
                     return_dict=False,
                 )[0]
 
-        hidden_states = self.spade(hidden_states, semb, size=hidden_states.shape[-1])
-
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
                 hidden_states = upsampler(hidden_states, upsample_size)
 
         return hidden_states
+
 
 def get_down_block_sdsr(
     down_block_type: str,
@@ -1352,7 +1576,56 @@ class UNet2DHalfSDSR(UNet2DConditionModel):
         cross_attention_norm: Optional[str] = None,
         addition_embed_type_num_heads: int = 64,
     ):
-        super().__init__()
+        super().__init__(
+            sample_size = sample_size,
+            in_channels = in_channels,
+            out_channels = out_channels,
+            center_input_sample = center_input_sample,
+            flip_sin_to_cos = flip_sin_to_cos,
+            freq_shift = freq_shift,
+            down_block_types = down_block_types,
+            mid_block_type = mid_block_type,
+            up_block_types = up_block_types,
+            only_cross_attention = only_cross_attention,
+            block_out_channels = block_out_channels,
+            layers_per_block = layers_per_block,
+            downsample_padding = downsample_padding,
+            mid_block_scale_factor = mid_block_scale_factor,
+            dropout = dropout,
+            act_fn = act_fn,
+            norm_num_groups = norm_num_groups,
+            norm_eps = norm_eps,
+            cross_attention_dim = cross_attention_dim,
+            transformer_layers_per_block = transformer_layers_per_block,
+            reverse_transformer_layers_per_block = reverse_transformer_layers_per_block,
+            encoder_hid_dim = encoder_hid_dim,
+            encoder_hid_dim_type = encoder_hid_dim_type,
+            attention_head_dim = attention_head_dim,
+            num_attention_heads = num_attention_heads,
+            dual_cross_attention = dual_cross_attention,
+            use_linear_projection = use_linear_projection,
+            class_embed_type = class_embed_type,
+            addition_embed_type = addition_embed_type,
+            addition_time_embed_dim = addition_time_embed_dim,
+            num_class_embeds = num_class_embeds,
+            upcast_attention = upcast_attention,
+            resnet_time_scale_shift = resnet_time_scale_shift,
+            resnet_skip_time_act = resnet_skip_time_act,
+            resnet_out_scale_factor = resnet_out_scale_factor,
+            time_embedding_type = time_embedding_type,
+            time_embedding_dim = time_embedding_dim,
+            time_embedding_act_fn = time_embedding_act_fn,
+            timestep_post_act = timestep_post_act,
+            time_cond_proj_dim = time_cond_proj_dim,
+            conv_in_kernel = conv_in_kernel,
+            conv_out_kernel = conv_out_kernel,
+            projection_class_embeddings_input_dim = projection_class_embeddings_input_dim,
+            attention_type = attention_type,
+            class_embeddings_concat = class_embeddings_concat,
+            mid_block_only_cross_attention = mid_block_only_cross_attention,
+            cross_attention_norm = cross_attention_norm,
+            addition_embed_type_num_heads = addition_embed_type_num_heads,
+        )
 
         self.sample_size = sample_size
 
@@ -1509,39 +1782,45 @@ class UNet2DHalfSDSR(UNet2DConditionModel):
             )
             self.down_blocks.append(down_block)
 
-        # mid
-        self.mid_block = get_mid_block(
-            mid_block_type,
-            temb_channels=blocks_time_embed_dim,
+        self.mid_block = UNetMidBlock2D(
             in_channels=block_out_channels[-1],
+            temb_channels=blocks_time_embed_dim,
+            dropout=dropout,
+            num_layers=1,
             resnet_eps=norm_eps,
             resnet_act_fn=act_fn,
-            resnet_groups=norm_num_groups,
             output_scale_factor=mid_block_scale_factor,
-            transformer_layers_per_block=transformer_layers_per_block[-1],
-            num_attention_heads=num_attention_heads[-1],
-            cross_attention_dim=cross_attention_dim[-1],
-            dual_cross_attention=dual_cross_attention,
-            use_linear_projection=use_linear_projection,
-            mid_block_only_cross_attention=mid_block_only_cross_attention,
-            upcast_attention=upcast_attention,
+            resnet_groups=norm_num_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
-            attention_type=attention_type,
-            resnet_skip_time_act=resnet_skip_time_act,
-            cross_attention_norm=cross_attention_norm,
-            attention_head_dim=attention_head_dim[-1],
-            dropout=dropout,
+            attention_head_dim=block_out_channels[-1] // 4,
+            add_attention=True,
         )
 
         # count how many layers upsample the images
         self.num_upsamplers = 0
-
 
         # disable later params
         self.up_blocks = nn.ModuleList([])
         self.conv_norm_out = None
         self.conv_act = None
         self.conv_out = None
+
+        self.fea_tran = nn.ModuleList([])
+        for i in range(len(block_out_channels)):
+            self.fea_tran.append(
+                ResnetBlock2D(
+                    in_channels=block_out_channels[i],
+                    out_channels=out_channels,
+                    temb_channels=blocks_time_embed_dim,
+                    eps=norm_eps,
+                    groups=norm_num_groups,
+                    dropout=dropout,
+                    time_embedding_norm=resnet_time_scale_shift,
+                    non_linearity=act_fn,
+                    output_scale_factor=mid_block_scale_factor,
+                    pre_norm=True,
+                )
+            )
 
     def forward(
         self,
@@ -1735,31 +2014,35 @@ class UNet2DHalfSDSR(UNet2DConditionModel):
                 sample = self.mid_block(sample, emb)
 
         results = {
-            "64": down_block_res_samples[2],
-            "32": down_block_res_samples[5],
-            "16": down_block_res_samples[8],
-            "8": sample,
+            "64": self.fea_tran[0](down_block_res_samples[2], emb),
+            "32": self.fea_tran[1](down_block_res_samples[5], emb),
+            "16": self.fea_tran[2](down_block_res_samples[8], emb),
+            "8":  self.fea_tran[3](sample, emb),
         }
+        down_block_res_samples = down_block_res_samples + (sample, )
 
-        return results
+        return results, emb, down_block_res_samples
 
 if __name__ == "__main__":
 
     from diffusers import AutoencoderKL
     from diffusers.schedulers import DDPMScheduler
+    from stablesr2diffusers import convert_unet, convert_struct
     from train_controlnet import import_model_class_from_model_name_or_path
     from pipe import StableSRPipeline
-    
+    ckpt_path = "/NEW_EDS/JJ_Group/xutd/StableSR/logs/2024-07-28T20-52-46_sdsr_reimpl/checkpoints/last.ckpt"
+    unet_ckpt = convert_unet(ckpt_path)
+    struct_ckpt = convert_struct(ckpt_path)
     model = UNet2DHalfSDSR(
         in_channels=4,
         out_channels=256,
-        attention_head_dim=[4,4,4,4],
-        block_out_channels=[256,256,256,256],
+        attention_head_dim=[64,64,128,128],
+        block_out_channels=[256,256,512,512],
         cross_attention_dim=1024,
         down_block_types=[
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
+            "AttnDownBlock2D",
+            "AttnDownBlock2D",
+            "AttnDownBlock2D",
             "DownBlock2D"
         ],
         downsample_padding=1,
@@ -1772,8 +2055,8 @@ if __name__ == "__main__":
         norm_num_groups=32,
         sample_size=96,
     )
+    model.load_state_dict(struct_ckpt)
 
-    model.enable_xformers_memory_efficient_attention()
     model_unet = UNet2DSDSR(
         in_channels=4,
         out_channels=4,
@@ -1803,7 +2086,10 @@ if __name__ == "__main__":
         ],
         use_linear_projection=True,
     )
+    model_unet.load_state_dict(unet_ckpt)
+
     model_unet.enable_xformers_memory_efficient_attention()
+    model.enable_xformers_memory_efficient_attention()
 
     scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="scheduler")
 
@@ -1846,8 +2132,8 @@ if __name__ == "__main__":
     input = torch.randn([1, 3, 512, 512]).cuda()
     _, xhat, _ = pipe(prompt_embeds=encoder_hidden_states,
                       image=input,
-                        height=512,
-                        width=512,
-                        num_inference_steps=500,
-                        guidance_scale=0.0)
+                      height=512,
+                      width=512,
+                      num_inference_steps=500,
+                      guidance_scale=0.0)
     print(xhat.shape)

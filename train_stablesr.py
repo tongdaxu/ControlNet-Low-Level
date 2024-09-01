@@ -119,15 +119,15 @@ def log_validation(
         torch_dtype=weight_dtype,
     )
     # do not do image processing here
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline.scheduler = DDPMScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
+    unet.disable_xformers_memory_efficient_attention()
+    cond_encoder.disable_xformers_memory_efficient_attention()
+
     pipeline.unet = unet
     pipeline.controlnet = cond_encoder
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
 
     if args.seed is None:
         generator = None
@@ -150,7 +150,7 @@ def log_validation(
         for _ in range(args.num_validation_images):
             with inference_ctx:
                 _, image, _ = pipeline(
-                    image=controlnet_image, prompt_embeds=encoder_hidden_states, num_inference_steps=20, generator=generator,
+                    image=controlnet_image, prompt_embeds=encoder_hidden_states, num_inference_steps=250, generator=generator,
                     guidance_scale=0.0,
                 )
             image = (image + 1.0 / 2.0)
@@ -180,11 +180,15 @@ def log_validation(
         else:
             logger.warning(f"image logging not implemented for {tracker.name}")
 
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
+    del pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
-        return image_logs
+    if args.enable_xformers_memory_efficient_attention:
+        unet.enable_xformers_memory_efficient_attention()
+        cond_encoder.enable_xformers_memory_efficient_attention()
+
+    return image_logs
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -623,13 +627,13 @@ def main(args):
     cond_encoder = UNet2DHalfSDSR(
         in_channels=4,
         out_channels=256,
-        attention_head_dim=[4,4,4,4],
-        block_out_channels=[256,256,256,256],
+        attention_head_dim=[4,4,8,8],
+        block_out_channels=[256,256,512,512],
         cross_attention_dim=1024,
         down_block_types=[
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
+            "AttnDownBlock2D",
+            "AttnDownBlock2D",
+            "AttnDownBlock2D",
             "DownBlock2D"
         ],
         downsample_padding=1,
